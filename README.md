@@ -24,19 +24,32 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 
 `AsyncCrawler.fetch_and_parse(url)` fetches and parses a page and returns `url`, `title`, `text`, `links`, `metadata` (plus `images`, `headings`, `tables`, `lists`, `errors`). Broken HTML, failing extractors and fetch errors never raise: the result is partial and the reasons are in `errors`.
 
+## Day 3 — concurrency control and the crawl queue
+
+- `CrawlerQueue` — priority queue of URLs: `add_url(url, priority=0)`, `async get_next()`, `mark_processed(url)`, `mark_failed(url, error)`, `get_stats()`. Higher priority comes first, every URL is accepted only once.
+- `SemaphoreManager` — a global limit (`max_concurrent`) plus a limit per domain (`max_per_domain`), tracks active and peak requests.
+- `URLFilter` — `same_domain_only`, `include_patterns`, `exclude_patterns` (regexes); links to images, PDFs, archives etc. are always skipped.
+- `AsyncCrawler.crawl(start_urls, max_pages=100, ...)` — breadth-first crawl with a `max_depth` limit and no duplicates. State is kept in `visited_urls`, `processed_urls` (url → parsed page with `depth`) and `failed_urls` (url → error). Progress (pages, queue, errors, pages/s) is printed every `progress_interval` seconds; `get_stats()` returns the same numbers.
+
 ## Structure
 
 ```
 ├── src/
 │   ├── main.py         demo: sequential vs concurrent fetching
 │   ├── parse_demo.py   demo: fetching and parsing pages
+│   ├── crawl_demo.py   demo: crawling a site with live progress
 │   ├── crawler.py      AsyncCrawler class
+│   ├── crawler_queue.py     CrawlerQueue class
+│   ├── semaphore_manager.py SemaphoreManager class
+│   ├── url_filter.py   URLFilter, URL canonicalization
 │   ├── html_parser.py  HTMLParser class
 │   ├── models.py       FetchResult
 │   └── utils.py        logging setup and report output
 ├── tests/
 │   ├── test_crawler.py
-│   └── test_parser.py
+│   ├── test_parser.py
+│   ├── test_queue.py   queue, semaphores, filters
+│   └── test_crawl.py   crawl(): depth, filters, duplicates, stats
 └── docs/
     └── algorithm.md
 ```
@@ -55,6 +68,8 @@ pip install -r requirements.txt
 ```bash
 python src/main.py         # day 1 demo (needs internet)
 python src/parse_demo.py   # day 2 demo (needs internet)
+python src/crawl_demo.py   # day 3 demo (needs internet), saves output/crawl_results.json
+python src/crawl_demo.py https://books.toscrape.com --max-pages 30 --max-depth 1
 pytest                     # tests (local server, no internet needed)
 ```
 
@@ -80,4 +95,16 @@ async def main():
     async with AsyncCrawler() as crawler:
         page = await crawler.fetch_and_parse("https://www.python.org")
     print(page["title"], len(page["links"]), page["metadata"]["description"])
+```
+
+```python
+async def main():
+    async with AsyncCrawler(max_concurrent=10, max_per_domain=5, max_depth=2) as crawler:
+        results = await crawler.crawl(
+            start_urls=["https://quotes.toscrape.com/"],
+            max_pages=50,
+            same_domain_only=True,
+            exclude_patterns=[r"/login"],
+        )
+    print(f"Processed: {len(results)} pages, failed: {len(crawler.failed_urls)}")
 ```

@@ -73,3 +73,50 @@ Image `src` (or `data-src` for lazy loading) goes through the same `normalize_ur
 1. The page is fetched via the day 1 `_fetch`; `FetchResult.final_url` now stores the address after redirects.
 2. On a fetch error it returns an empty result with `errors: ["fetch: <reason>"]`.
 3. Otherwise the HTML is parsed against `final_url` — after a redirect, relative links resolve against the page they actually come from — and `url` is set back to the requested address.
+
+## Day 3 — crawl queue and concurrency control
+
+### Components
+
+- `CrawlerQueue` ([src/crawler_queue.py](../src/crawler_queue.py)) — the URL queue and per-URL state.
+- `SemaphoreManager` ([src/semaphore_manager.py](../src/semaphore_manager.py)) — global and per-domain limits.
+- `URLFilter`, `canonicalize` ([src/url_filter.py](../src/url_filter.py)) — which links to follow and how to compare them.
+- `AsyncCrawler.crawl` ([src/crawler.py](../src/crawler.py)) — workers that drive the crawl.
+- [src/crawl_demo.py](../src/crawl_demo.py) — the demo.
+
+### Queue (`CrawlerQueue`)
+
+- A `heapq` of `(-priority, counter, url)`: higher priority pops first, the counter keeps FIFO order among equal priorities.
+- `_seen` holds every URL ever added, so a URL that is queued, in progress, processed or failed is never added again.
+- A URL moves queued → `in_progress` → `processed` | `failed`.
+- `get_next()` returns the next URL. If the heap is empty but some URLs are still in progress, it waits on an `asyncio.Event` (set by `add_url`, `mark_processed`, `mark_failed`): those pages may still add links. When both are empty, the crawl is over and it returns `None`. After `close()` it returns `None` at once.
+
+### Concurrency (`SemaphoreManager`)
+
+`acquire(url)` is an async context manager that takes the domain's semaphore (`max_per_domain`, created on first use) and then the global one (`max_concurrent`). The domain slot comes first: a request waiting for a busy domain must not hold a global slot that a request to another domain could use. Inside, it counts active requests per domain and records peaks. `_fetch` now runs under `acquire(url)` instead of the day 1 semaphore. `www.` is ignored when comparing domains.
+
+### Crawl (`crawl`)
+
+1. State is reset: a new queue, `visited_urls`, `processed_urls`, `failed_urls`.
+2. Start URLs are validated with `normalize_url`, canonicalized and queued with depth 0. Their hosts become the allowed domains for `same_domain_only`. Start URLs skip `include/exclude` — they are what the user asked for.
+3. `max_concurrent` workers run in parallel. Each one loops:
+   1. `get_next()`; `None` → the worker exits.
+   2. Count the page against `max_pages` (failed pages count too); when the limit is reached, `queue.close()` stops the others from taking more. The remaining URLs stay in the queue.
+   3. Add the URL to `visited_urls`, run `fetch_and_parse`.
+   4. Fetch error → `failed_urls[url] = error`, `mark_failed`. Any unexpected exception is handled the same way, so one bad page never stops the crawl.
+   5. Success → `processed_urls[url] = page` with `page["depth"]`. After a redirect the target URL is also marked visited/seen, so it isn't fetched a second time.
+   6. Every link is canonicalized and checked: rejected by `URLFilter` → skipped; `depth >= max_depth` → skipped; otherwise queued with `depth + 1` and priority `-(depth + 1)`, so shallower pages go first (breadth-first order).
+   7. `mark_processed`. Links are queued **before** this call: while the page is in progress, idle workers wait in `get_next()` instead of deciding the crawl is over.
+4. A progress task prints a line every `progress_interval` seconds. On an error or cancellation all tasks are cancelled and awaited, so nothing outlives `crawl()`.
+
+### Deduplication (`canonicalize`)
+
+The parser already makes links absolute and drops the `#fragment`. `canonicalize` additionally lowercases the scheme and host, drops the default port and turns an empty path into `/`, so `https://Example.com`, `https://example.com/` and `https://example.com:443/#top` are the same queue entry. Query strings and path case are kept: they can point to different pages.
+
+### Filters (`URLFilter.is_allowed`)
+
+In order: only `http/https` with a host; no binary file extensions (images, PDF, archives, media, CSS/JS...); `same_domain_only` → the host must be one of the start hosts; no `exclude_patterns` match (`re.search`); if `include_patterns` are given, at least one must match.
+
+### Statistics
+
+`get_stats()` = queue counters (`queued`, `in_progress`, `processed`, `failed`, `seen`) + `visited`, `skipped` (`filtered`, `too_deep`), `elapsed`, `pages_per_sec` = (processed + failed) / elapsed, and the `SemaphoreManager` counters (active, peaks, total requests).
