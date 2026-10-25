@@ -1,4 +1,4 @@
-"""Day 1 — basic asynchronous HTTP client built on aiohttp."""
+"""Asynchronous HTTP client built on aiohttp (day 1) with HTML parsing (day 2)."""
 
 import asyncio
 import logging
@@ -6,6 +6,7 @@ import time
 
 import aiohttp
 
+from html_parser import HTMLParser
 from models import FetchResult
 
 logger = logging.getLogger("crawler")
@@ -20,6 +21,7 @@ class AsyncCrawler:
         connect_timeout: float = 5.0,
         read_timeout: float = 10.0,
         total_timeout: float = 30.0,
+        parser: HTMLParser | None = None,
     ):
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -31,6 +33,7 @@ class AsyncCrawler:
         )
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
+        self.parser = parser or HTMLParser()
         # Detailed results of the latest requests (status, error, timing)
         self.results: dict[str, FetchResult] = {}
 
@@ -63,6 +66,7 @@ class AsyncCrawler:
             try:
                 async with session.get(url) as response:
                     result.status = response.status
+                    result.final_url = str(response.url)
                     result.content = await response.text()
             # ClientResponseError subclasses ClientError, so it goes first
             except aiohttp.ClientResponseError as e:
@@ -93,6 +97,22 @@ class AsyncCrawler:
         """Fetch a list of URLs concurrently. Returns successful ones only."""
         results = await asyncio.gather(*(self._fetch(url) for url in urls))
         return {r.url: r.content for r in results if r.ok}
+
+    async def fetch_and_parse(self, url: str) -> dict:
+        """Fetch and parse a page: url, title, text, links, metadata and more.
+
+        On a fetch error returns the same keys with empty values and the
+        reason in "errors".
+        """
+        result = await self._fetch(url)
+        if not result.ok:
+            page = self.parser.empty_result(url)
+            page["errors"] = [f"fetch: {result.error}"]
+            return page
+        # Relative links resolve against the address after redirects
+        page = await self.parser.parse_html(result.content, result.final_url or url)
+        page["url"] = url
+        return page
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
