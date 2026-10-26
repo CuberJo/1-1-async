@@ -92,7 +92,7 @@ async def test_queue_stats():
     q.mark_processed(await q.get_next())
     q.mark_failed(await q.get_next(), "Timeout")
     await q.get_next()
-    assert q.get_stats() == {"queued": 1, "in_progress": 1, "processed": 1, "failed": 1, "seen": 4}
+    assert q.get_stats() == {"queued": 1, "in_progress": 1, "processed": 1, "failed": 1, "blocked": 0, "seen": 4}
     assert q.failed == {"b": "Timeout"}
 
 

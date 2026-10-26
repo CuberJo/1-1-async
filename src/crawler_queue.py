@@ -11,7 +11,7 @@ class CrawlerQueue:
     - higher priority comes out first, equal priorities keep FIFO order;
     - a URL is accepted only once: re-adding a queued, in-progress, processed
       or failed URL is ignored;
-    - every URL goes queued -> in progress -> processed | failed;
+    - every URL goes queued -> in progress -> processed | failed | blocked;
     - get_next() waits while the queue is empty but some URLs are still in
       progress (they may add new links) and returns None once the crawl is over.
     """
@@ -26,6 +26,7 @@ class CrawlerQueue:
         self.in_progress: set[str] = set()
         self.processed: set[str] = set()
         self.failed: dict[str, str] = {}
+        self.blocked: set[str] = set()  # disallowed by robots.txt
 
     def add_url(self, url: str, priority: int = 0, depth: int = 0) -> bool:
         """Add a URL. Returns False if it was seen before or the queue is closed."""
@@ -67,6 +68,11 @@ class CrawlerQueue:
         self.failed[url] = error
         self._changed.set()
 
+    def mark_blocked(self, url: str) -> None:
+        self.in_progress.discard(url)
+        self.blocked.add(url)
+        self._changed.set()
+
     def close(self) -> None:
         """Stop handing out URLs: get_next() returns None from now on."""
         self._closed = True
@@ -84,5 +90,6 @@ class CrawlerQueue:
             "in_progress": len(self.in_progress),
             "processed": len(self.processed),
             "failed": len(self.failed),
+            "blocked": len(self.blocked),
             "seen": len(self._seen),
         }

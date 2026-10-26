@@ -120,3 +120,50 @@ In order: only `http/https` with a host; no binary file extensions (images, PDF,
 ### Statistics
 
 `get_stats()` = queue counters (`queued`, `in_progress`, `processed`, `failed`, `seen`) + `visited`, `skipped` (`filtered`, `too_deep`), `elapsed`, `pages_per_sec` = (processed + failed) / elapsed, and the `SemaphoreManager` counters (active, peaks, total requests).
+
+## Day 4 — rate limiting and politeness
+
+### Components
+
+- `RateLimiter`, `backoff_delay` ([src/rate_limiter.py](../src/rate_limiter.py)) — spacing between requests and retry delays.
+- `RobotsParser`, `parse_robots` ([src/robots_parser.py](../src/robots_parser.py)) — robots.txt loading, parsing and checks.
+- `AsyncCrawler` ([src/crawler.py](../src/crawler.py)) — applies both before every request, rotates User-Agents, retries temporary errors.
+- [src/polite_demo.py](../src/polite_demo.py) — the demo.
+
+### Rate limiting (`RateLimiter.acquire`)
+
+The limiter hands out start times ("slots"). `_next[key]` is the earliest time the next request with that key may start. The key is the domain, or one shared key when `per_domain=False`.
+
+1. `start = max(now, _next[key])`, then `_next[key] = start + interval`, where `interval = max(1 / requests_per_second, min_delay) + uniform(0, jitter)`.
+2. If the domain has a `Crawl-delay`, the domain's own slot is taken into account too, with `max(interval, crawl_delay)`. In global mode a slow site therefore doesn't slow down the others.
+3. The caller sleeps `start - now`.
+
+There is no `await` between reading and updating `_next`, so concurrent callers can't take the same slot. They are served in arrival order, one interval apart. N requests to one domain take `(N - 1) * interval`. Different domains don't wait for each other.
+
+`acquire` is called in `_fetch_once` **inside** the semaphores, right before the request. A task waiting for its slot does hold a concurrency slot. In exchange, nothing can delay the request after its slot comes up. If the limiter ran before the semaphores instead, requests that had waited for a free slot would start together, in a burst.
+
+Statistics: each request records its start time. `current_rps` = (n − 1) / span over the requests of the last `window` seconds. `avg_gap` / `min_gap` are measured between consecutive requests to the same domain. `avg_wait` is the average sleep. `history` keeps the last 1000 requests for reports. `crawl()` resets the statistics but keeps the slots, so a new crawl stays polite to sites it has just visited.
+
+### robots.txt (`RobotsParser`)
+
+Parsing (`parse_robots`):
+- `#` comments and lines without `:` are ignored; field names are case-insensitive.
+- `User-agent` lines in a row form one group. A `User-agent` line after rules starts a new group. Rules before the first `User-agent` are ignored.
+- `Allow` / `Disallow` patterns become regexes: `*` is any sequence, a trailing `$` anchors the end, otherwise it's a prefix match. An empty `Disallow` means no rule. Percent-encoding is decoded in both the pattern and the path.
+- `Crawl-delay` belongs to the group, `Sitemap` to the whole file.
+
+Matching (`can_fetch`):
+1. The group is chosen by our User-Agent's product token (`MyBot/1.0 (...)` → `mybot`). The longest group name contained in it wins, otherwise `*`. Groups with the same name are combined. A specific group fully replaces `*`.
+2. Among the group's rules that match the path (with the query string), the longest pattern wins. On a tie `Allow` wins. No match → allowed. `/robots.txt` itself is always allowed.
+
+Loading (`fetch_robots`): one download per origin (scheme + host + port), cached. An `asyncio.Lock` per origin makes concurrent callers wait for one shared download. The body is read up to 500 KiB. 2xx → rules from the file; 4xx → everything allowed; 429/5xx → everything disallowed (RFC 9309: the site is unavailable); a network error → everything allowed, and the page request reports the real error.
+
+### Crawler integration
+
+- `_fetch(url)`: with `respect_robots`, `_robots_allowed` first loads/reads the cached rules and passes `Crawl-delay` to `RateLimiter.set_domain_delay`. If the URL is disallowed, it's added to `blocked_urls`, logged once as a warning, and a `FetchResult(blocked=True, error="Blocked by robots.txt")` is returned without a request.
+- In `crawl()` the worker checks robots.txt **before** counting a page against `max_pages`. Blocked URLs go to the new `blocked` queue state, not to `failed`.
+- The User-Agent is set per request: `next()` on a cycle over `user_agent` (a string or a list). robots.txt rules are always checked for the first one, so the decisions don't change between requests.
+
+### Retries with exponential backoff
+
+`_fetch` calls `_fetch_once` up to `max_retries + 1` times. Errors are retried only if they are temporary: timeouts, HTTP 429/500/502/503/504, `ServerDisconnectedError`, `ClientPayloadError`. A 404 or a DNS error fails at once. The delay before retry `n` (from 0) is `min(backoff_max, max(backoff_base * 2**n + uniform(0, jitter), Retry-After))`. The sleep happens outside the semaphores, so a backing-off task holds no slot. Each retry also goes through the rate limiter. `FetchResult.attempts` and `crawler.retries` count the attempts.

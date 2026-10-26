@@ -31,6 +31,19 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 - `URLFilter` — `same_domain_only`, `include_patterns`, `exclude_patterns` (regexes); links to images, PDFs, archives etc. are always skipped.
 - `AsyncCrawler.crawl(start_urls, max_pages=100, ...)` — breadth-first crawl with a `max_depth` limit and no duplicates. State is kept in `visited_urls`, `processed_urls` (url → parsed page with `depth`) and `failed_urls` (url → error). Progress (pages, queue, errors, pages/s) is printed every `progress_interval` seconds; `get_stats()` returns the same numbers.
 
+## Day 4 — rate limiting and politeness
+
+- `RateLimiter(requests_per_second=1.0, per_domain=True, min_delay=0.0, jitter=0.0)` — `await acquire(domain)` waits until the next request may start. Each domain has its own limit, or one limit is shared by all requests with `per_domain=False`. The interval is `max(1 / requests_per_second, min_delay)` plus a random `0..jitter` seconds. `set_domain_delay(domain, seconds)` adds a per-domain minimum on top (used for `Crawl-delay`).
+- `RobotsParser` — `async fetch_robots(url) -> dict` downloads robots.txt once per site and caches it; `can_fetch(url, user_agent="*")` and `get_crawl_delay(user_agent="*", url=None)` answer from the cache. Supports user-agent groups, `Allow`/`Disallow` with `*` and `$`, longest-match precedence, `Crawl-delay`, `Sitemap`.
+- `AsyncCrawler` has new options:
+  - `requests_per_second`, `per_domain_rate`, `min_delay`, `jitter` set the rate limit, applied right before every request;
+  - `respect_robots=True` checks robots.txt before every request. Disallowed URLs are not requested; they are logged and collected in `blocked_urls`. `Crawl-delay` is passed to the rate limiter;
+  - `user_agent` is a string or a list of strings that rotate. robots.txt rules are checked for the first one;
+  - `max_retries`, `backoff_base`, `backoff_max` retry timeouts, 429 and 5xx after `base * 2**attempt` seconds, and honour `Retry-After`.
+
+  All new options default to "off", so the crawler behaves as on day 3 unless you set them.
+- Monitoring: `get_stats()["rate"]` has `current_rps`, `avg_gap` / `min_gap` (time between requests to one domain), `avg_wait`, `domain_delays`. It also has `robots_blocked` and `retries`. The progress line shows the blocked count, req/s and the average gap.
+
 ## Structure
 
 ```
@@ -38,9 +51,12 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── main.py         demo: sequential vs concurrent fetching
 │   ├── parse_demo.py   demo: fetching and parsing pages
 │   ├── crawl_demo.py   demo: crawling a site with live progress
+│   ├── polite_demo.py  demo: robots.txt, rate limiting, delay statistics
 │   ├── crawler.py      AsyncCrawler class
 │   ├── crawler_queue.py     CrawlerQueue class
 │   ├── semaphore_manager.py SemaphoreManager class
+│   ├── rate_limiter.py RateLimiter, exponential backoff
+│   ├── robots_parser.py     RobotsParser, robots.txt parsing
 │   ├── url_filter.py   URLFilter, URL canonicalization
 │   ├── html_parser.py  HTMLParser class
 │   ├── models.py       FetchResult
@@ -49,7 +65,10 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── test_crawler.py
 │   ├── test_parser.py
 │   ├── test_queue.py   queue, semaphores, filters
-│   └── test_crawl.py   crawl(): depth, filters, duplicates, stats
+│   ├── test_crawl.py   crawl(): depth, filters, duplicates, stats
+│   ├── test_rate_limiter.py  rate limits, delays, jitter, backoff
+│   ├── test_robots.py  robots.txt parsing, matching, loading, cache
+│   └── test_polite_crawl.py  crawler + robots.txt, rate limits, User-Agent, retries
 └── docs/
     └── algorithm.md
 ```
@@ -70,6 +89,8 @@ python src/main.py         # day 1 demo (needs internet)
 python src/parse_demo.py   # day 2 demo (needs internet)
 python src/crawl_demo.py   # day 3 demo (needs internet), saves output/crawl_results.json
 python src/crawl_demo.py https://books.toscrape.com --max-pages 30 --max-depth 1
+python src/polite_demo.py  # day 4 demo on a local site with robots.txt (no internet needed)
+python src/polite_demo.py https://docs.python.org/3/ --max-pages 15 --rps 1
 pytest                     # tests (local server, no internet needed)
 ```
 
@@ -107,4 +128,20 @@ async def main():
             exclude_patterns=[r"/login"],
         )
     print(f"Processed: {len(results)} pages, failed: {len(crawler.failed_urls)}")
+```
+
+```python
+async def main():
+    async with AsyncCrawler(
+        max_concurrent=5,
+        requests_per_second=2.0,  # 2 requests per second per domain
+        respect_robots=True,
+        min_delay=0.5,            # at least 0.5s between requests
+        jitter=0.2,               # plus up to 0.2s at random
+        user_agent="MyBot/1.0",
+        max_retries=2,
+    ) as crawler:
+        await crawler.crawl(["https://docs.python.org/3/"], max_pages=20)
+    stats = crawler.get_stats()
+    print(stats["rate"]["avg_gap"], stats["robots_blocked"], sorted(crawler.blocked_urls))
 ```

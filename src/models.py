@@ -13,6 +13,10 @@ class FetchResult:
     error: str | None = None
     elapsed: float = 0.0
     final_url: str | None = None  # address after redirects
+    attempts: int = 0  # requests made, retries included
+    blocked: bool = False  # disallowed by robots.txt, never requested
+    retryable: bool = False  # the error is temporary (timeout, 429, 5xx...)
+    retry_after: float | None = None  # seconds, from the Retry-After header
 
     @property
     def ok(self) -> bool:
