@@ -166,4 +166,62 @@ Loading (`fetch_robots`): one download per origin (scheme + host + port), cached
 
 ### Retries with exponential backoff
 
-`_fetch` calls `_fetch_once` up to `max_retries + 1` times. Errors are retried only if they are temporary: timeouts, HTTP 429/500/502/503/504, `ServerDisconnectedError`, `ClientPayloadError`. A 404 or a DNS error fails at once. The delay before retry `n` (from 0) is `min(backoff_max, max(backoff_base * 2**n + uniform(0, jitter), Retry-After))`. The sleep happens outside the semaphores, so a backing-off task holds no slot. Each retry also goes through the rate limiter. `FetchResult.attempts` and `crawler.retries` count the attempts.
+`_fetch` calls `_fetch_once` up to `max_retries + 1` times. Errors are retried only if they are temporary: timeouts, HTTP 429/500/502/503/504, `ServerDisconnectedError`, `ClientPayloadError`. A 404 or a DNS error fails at once. The delay before retry `n` (from 0) is `min(backoff_max, max(backoff_base * 2**n + uniform(0, jitter), Retry-After))`. The sleep happens outside the semaphores, so a backing-off task holds no slot. Each retry also goes through the rate limiter. `FetchResult.attempts` and `crawler.retries` count the attempts. Since day 5 this loop lives in `RetryStrategy` (below); the day 4 options build one.
+
+## Day 5 — error handling and retries
+
+### Components
+
+- `CrawlerError` and its subclasses, `classify_exception` ([src/errors.py](../src/errors.py)).
+- `RetryStrategy`, `ErrorPolicy`, `RetryStats` ([src/retry_strategy.py](../src/retry_strategy.py)).
+- `CircuitBreaker` ([src/circuit_breaker.py](../src/circuit_breaker.py)).
+- `AsyncCrawler` ([src/crawler.py](../src/crawler.py)) — runs every fetch through the strategy.
+- [src/retry_demo.py](../src/retry_demo.py) — the demo.
+
+### Classification (`classify_exception`)
+
+Checked in this order, because some aiohttp exceptions belong to several families:
+
+1. Already a `CrawlerError` → as is. `CancelledError` → `None` (it must propagate).
+2. `TooManyRedirects` (subclasses `ClientResponseError`) → `PermanentError`.
+3. `ClientResponseError` → by status: 408, 425, 429 and every 5xx → `TransientError`, other 4xx → `PermanentError`. `Retry-After` (seconds) is kept.
+4. `asyncio.TimeoutError` (`ServerTimeoutError` is a `ClientError` too) → `TransientError("Timeout")`.
+5. `ClientSSLError`, `InvalidURL` → `PermanentError`: they won't fix themselves.
+6. Other `ClientError`, `ConnectionError`, `OSError` → `NetworkError` (refused, reset, DNS, a cut-off body).
+7. `UnicodeDecodeError` → `ParseError`.
+8. Anything else → `None`: a bug, re-raised unchanged and never retried.
+
+The messages are the ones of day 1 (`HTTP 404 Not Found`, `Timeout`, `ClientConnectorError: ...`), so `failed_urls` reads the same.
+
+### `RetryStrategy.execute_with_retry(coro_func, *args, **kwargs)`
+
+It takes a coroutine *function* and its arguments: a coroutine object can be awaited only once, so it is rejected with `TypeError`.
+
+For attempt `a = 1, 2, ...`:
+
+1. Await `coro_func(...)`. Success → count it (and as a "saved" fetch if `a > 1`) and return.
+2. Classify the exception; `None` → re-raise.
+3. Look up the `ErrorPolicy`: by HTTP status first, then by the error's class and its bases. The retry limit for this error is `min(policy.max_retries, max_retries)`.
+4. If the error is one of `retry_on` (the classified error or its original exception, so raw types like `asyncio.TimeoutError` work too) and `a <= limit`: delay = `backoff_delay(a - 1, base_delay * policy.delay_multiplier, max_delay, jitter, retry_after, factor=policy.backoff_factor or backoff_factor)`, log a warning, sleep, repeat.
+5. Otherwise record the final failure (and the URL in `permanent_errors` for a `PermanentError`), set `error.attempts` and raise it.
+
+Default policies: `NetworkError` — at most 2 retries, delay ×2 (a network problem takes longer to clear and rarely does after a few tries); 429 — delay ×4 on top of `Retry-After`; 500 — 1 retry (often a bug rather than overload).
+
+`RetryStats`: `errors_by_type` / `errors_by_status` count every failed attempt, `history` keeps the last 1000 failed attempts (URL, attempt, type, status, message, duration, delay before the next one). `retry_time` sums, for every retry, the backoff sleep plus the repeated attempt; `avg_retry_time = retry_time / retries`.
+
+### Crawler integration
+
+- `_fetch(url)` creates one `FetchResult` and passes the strategy a closure that increments `result.attempts` and calls `_fetch_once(result)`. A final `CrawlerError` fills `error`, `error_type`, `status`, `retryable`, `retry_after`. The sleeps happen in the strategy, outside the semaphores.
+- `_fetch_once` passes `ClientTimeout` per request: `connect`, `sock_read` and `total` are multiplied by `timeout_growth ** (attempt - 1)`, so a slow server gets more time on each retry. Exceptions are classified there and re-raised.
+- `crawl()` resets the strategy's statistics together with the other counters; `crawler.retries` reads them.
+
+### Circuit breaker
+
+State per domain: `closed` → `open` → `half_open` → `closed` / `open`.
+
+- `closed`: outcomes of the last `window` requests are kept in a deque. When at least `min_requests` are known and `failures / known >= failure_rate`, the circuit opens.
+- `open`: `allow_request` refuses; `_fetch_once` raises `CircuitOpenError` without a request. It is not in `retry_on`, so the fetch fails at once instead of sleeping on a dead site.
+- After `recovery_timeout` the state reads as `half_open`: exactly one trial request passes (`probing` flag), the others are still refused. Success → `closed` with a clean window; failure → `open` for another `recovery_timeout`.
+
+Only `TransientError` and `NetworkError` count as failures: a 404 or a parse error means the server answered. The check runs inside the semaphores, after the rate limiter, right before the request: while a task waited for its slot, the others may have found the domain down.
+

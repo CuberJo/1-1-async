@@ -44,6 +44,17 @@ The `HTMLParser` class (BeautifulSoup + lxml):
   All new options default to "off", so the crawler behaves as on day 3 unless you set them.
 - Monitoring: `get_stats()["rate"]` has `current_rps`, `avg_gap` / `min_gap` (time between requests to one domain), `avg_wait`, `domain_delays`. It also has `robots_blocked` and `retries`. The progress line shows the blocked count, req/s and the average gap.
 
+## Day 5 — error handling and automatic retries
+
+- Error classes ([src/errors.py](src/errors.py)): `TransientError` (timeouts, 408/429/5xx), `PermanentError` (other 4xx, invalid URL, bad certificate, too many redirects), `NetworkError` (connection refused/reset, DNS), `ParseError` (a response that is not valid text). `classify_exception(exc, url)` maps aiohttp and OS exceptions to them; anything else (a bug) is not a request failure and propagates unchanged. Each error keeps `url`, `status`, `retry_after` and the `original` exception.
+- `RetryStrategy(max_retries=3, backoff_factor=2.0, retry_on=None, base_delay=0.5, max_delay=30, jitter=0, policies=None, status_policies=None, timeout_growth=1.5)` — `await execute_with_retry(coro_func, *args, **kwargs)`:
+  - retries only the `retry_on` types (default: `TransientError`, `NetworkError`), never `PermanentError` / `ParseError` unless you add them;
+  - the delay before retry `n` is `base_delay * multiplier * factor**n` (+ jitter), at least `Retry-After`, at most `max_delay`;
+  - an `ErrorPolicy(max_retries, delay_multiplier, backoff_factor)` per error type or HTTP status adjusts that: by default `NetworkError` gets at most 2 retries and twice the delay, 429 waits 4× longer, 500 is retried once;
+  - every failed attempt is logged (type, URL, attempt n/max, time until the next one), the final result too; `strategy.stats` counts errors by type and status, retries, fetches saved by a retry, the average time per retry, URLs with permanent errors.
+- `CircuitBreaker(failure_rate=0.5, min_requests=5, window=10, recovery_timeout=30)` ([src/circuit_breaker.py](src/circuit_breaker.py)) — per domain: when the share of failures among the last `window` requests reaches `failure_rate`, the domain is blocked for `recovery_timeout` seconds, then one trial request decides whether it is back.
+- `AsyncCrawler` has new options `retry_strategy` and `circuit_breaker`. Without a strategy it builds one from the day 4 `max_retries` / `backoff_base` / `backoff_max`, so the defaults still don't retry. Repeated attempts get `timeout_growth`× longer timeouts. `FetchResult` has `error_type`; `get_stats()` has `errors` and `circuits`; `get_error_report()` returns stats, failed URLs and the attempts log for saving. `fetch_once(url)` makes one request and raises the classified error — for a strategy of your own.
+
 ## Structure
 
 ```
@@ -52,11 +63,15 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── parse_demo.py   demo: fetching and parsing pages
 │   ├── crawl_demo.py   demo: crawling a site with live progress
 │   ├── polite_demo.py  demo: robots.txt, rate limiting, delay statistics
+│   ├── retry_demo.py   demo: error types, retries, circuit breaker, error report
 │   ├── crawler.py      AsyncCrawler class
 │   ├── crawler_queue.py     CrawlerQueue class
 │   ├── semaphore_manager.py SemaphoreManager class
 │   ├── rate_limiter.py RateLimiter, exponential backoff
 │   ├── robots_parser.py     RobotsParser, robots.txt parsing
+│   ├── errors.py       error classes and classification
+│   ├── retry_strategy.py    RetryStrategy, ErrorPolicy, RetryStats
+│   ├── circuit_breaker.py   CircuitBreaker
 │   ├── url_filter.py   URLFilter, URL canonicalization
 │   ├── html_parser.py  HTMLParser class
 │   ├── models.py       FetchResult
@@ -68,7 +83,8 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── test_crawl.py   crawl(): depth, filters, duplicates, stats
 │   ├── test_rate_limiter.py  rate limits, delays, jitter, backoff
 │   ├── test_robots.py  robots.txt parsing, matching, loading, cache
-│   └── test_polite_crawl.py  crawler + robots.txt, rate limits, User-Agent, retries
+│   ├── test_polite_crawl.py  crawler + robots.txt, rate limits, User-Agent, retries
+│   └── test_retry.py   error classes, retry strategies, backoff, circuit breaker, error stats
 └── docs/
     └── algorithm.md
 ```
@@ -91,6 +107,8 @@ python src/crawl_demo.py   # day 3 demo (needs internet), saves output/crawl_res
 python src/crawl_demo.py https://books.toscrape.com --max-pages 30 --max-depth 1
 python src/polite_demo.py  # day 4 demo on a local site with robots.txt (no internet needed)
 python src/polite_demo.py https://docs.python.org/3/ --max-pages 15 --rps 1
+python src/retry_demo.py   # day 5 demo on local sites with errors, saves output/error_report.json
+python src/retry_demo.py https://httpbin.org/status/503 https://httpbin.org/status/404 --read-timeout 2
 pytest                     # tests (local server, no internet needed)
 ```
 
@@ -144,4 +162,23 @@ async def main():
         await crawler.crawl(["https://docs.python.org/3/"], max_pages=20)
     stats = crawler.get_stats()
     print(stats["rate"]["avg_gap"], stats["robots_blocked"], sorted(crawler.blocked_urls))
+```
+
+```python
+from circuit_breaker import CircuitBreaker
+from errors import NetworkError, TransientError
+from retry_strategy import RetryStrategy
+
+async def main():
+    retry_strategy = RetryStrategy(
+        max_retries=3,
+        backoff_factor=2.0,
+        retry_on=[TransientError, NetworkError],
+    )
+    async with AsyncCrawler(retry_strategy=retry_strategy, circuit_breaker=CircuitBreaker()) as crawler:
+        await crawler.crawl(["https://quotes.toscrape.com/"], max_pages=20)
+        # Or one URL with a strategy of your own: raises on a final failure
+        html = await retry_strategy.execute_with_retry(crawler.fetch_once, "https://example.com")
+    errors = crawler.get_stats()["errors"]
+    print(errors["errors_by_type"], errors["successful_retries"], list(errors["permanent_errors"]))
 ```

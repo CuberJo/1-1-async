@@ -15,10 +15,11 @@ def backoff_delay(
     max_delay: float = 30.0,
     jitter: float = 0.0,
     retry_after: float | None = None,
+    factor: float = 2.0,
 ) -> float:
-    """Delay before retry number attempt + 1: base * 2**attempt plus up to
-    jitter seconds, at least the server's Retry-After, at most max_delay."""
-    delay = base * 2**attempt
+    """Delay before retry number attempt + 1: base * factor**attempt plus up
+    to jitter seconds, at least the server's Retry-After, at most max_delay."""
+    delay = base * factor**attempt
     if jitter:
         delay += random.uniform(0, jitter)
     if retry_after:

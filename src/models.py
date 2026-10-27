@@ -11,6 +11,7 @@ class FetchResult:
     content: str | None = None
     status: int | None = None
     error: str | None = None
+    error_type: str | None = None  # TransientError, PermanentError, NetworkError...
     elapsed: float = 0.0
     final_url: str | None = None  # address after redirects
     attempts: int = 0  # requests made, retries included
