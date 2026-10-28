@@ -1,13 +1,20 @@
 """Asynchronous HTTP client built on aiohttp (day 1) with HTML parsing (day 2),
 a queue-driven crawl with depth and concurrency control (day 3), polite
 crawling: rate limits, robots.txt (day 4), error handling: classified
-errors, retry strategies, a circuit breaker, error statistics (day 5) and
-saving pages to JSON, CSV or SQLite (day 6)."""
+errors, retry strategies, a circuit breaker, error statistics (day 5),
+saving pages to JSON, CSV or SQLite (day 6) and proxies, cookies, default
+headers (day 7).
+
+Run as a script for the day 7 command line: python src/crawler.py --help
+AdvancedCrawler (day 7) is importable from here too:
+    from crawler import AdvancedCrawler
+"""
 
 import asyncio
 import itertools
 import logging
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 import aiohttp
 
@@ -53,6 +60,20 @@ class AsyncCrawler:
     - storage: a DataStorage; every processed page is saved to it as a
       standard record (make_record). crawl() flushes it at the end, close()
       closes it. A storage error never stops the crawl.
+
+    Day 7 options:
+    - proxy: "http://user:pass@host:port" for every request (robots.txt and
+      sitemaps included);
+    - headers: sent with every request; User-Agent comes from user_agent;
+    - cookies: initial cookies. Cookies the sites set are kept for the
+      session (aiohttp's cookie jar), so logins and sessions work;
+    - keep_pages: False keeps only a short summary of every processed page
+      in processed_urls and drops the HTML from results: memory stays flat
+      on long crawls that save pages to a storage;
+    - parse_workers: parse pages in that many processes instead of a thread.
+      Parsing is CPU-bound and threads share one core (the GIL), so on a fast
+      network this is what limits the speed. Starting the processes takes
+      about a second, so it pays off from a few hundred pages.
     """
 
     def __init__(
@@ -77,6 +98,11 @@ class AsyncCrawler:
         retry_strategy: RetryStrategy | None = None,
         circuit_breaker: CircuitBreaker | None = None,
         storage: DataStorage | None = None,
+        proxy: str | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        keep_pages: bool = True,
+        parse_workers: int = 0,
     ):
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -84,6 +110,8 @@ class AsyncCrawler:
             raise ValueError("max_depth must be >= 0")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        if parse_workers < 0:
+            raise ValueError("parse_workers must be >= 0")
         user_agents = [user_agent] if isinstance(user_agent, str) else list(user_agent)
         if not user_agents:
             raise ValueError("user_agent must not be empty")
@@ -134,6 +162,14 @@ class AsyncCrawler:
         self.storage = storage
         self.storage_errors = 0  # exceptions a storage raised despite its contract
 
+        # Sessions and memory (day 7)
+        self.proxy = proxy
+        self.headers = dict(headers or {})
+        self.cookies = dict(cookies or {})
+        self.keep_pages = keep_pages
+        self.parse_workers = parse_workers
+        self._parse_pool: ProcessPoolExecutor | None = None
+
     async def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily, inside a running event loop
         if self._session is None or self._session.closed:
@@ -150,6 +186,11 @@ class AsyncCrawler:
                 connector=connector,
                 timeout=self.timeout,
                 raise_for_status=True,
+                proxy=self.proxy,
+                headers=self.headers,
+                cookies=self.cookies,
+                # Also keep cookies of sites addressed by IP (intranets, local tests)
+                cookie_jar=aiohttp.CookieJar(unsafe=True),
             )
         return self._session
 
@@ -298,8 +339,10 @@ class AsyncCrawler:
             page = self.parser.empty_result(url)
             page["errors"] = [f"fetch: {result.error}"]
             return page
+        if self.parse_workers and self._parse_pool is None:
+            self._parse_pool = ProcessPoolExecutor(self.parse_workers)
         # Relative links resolve against the address after redirects
-        page = await self.parser.parse_html(result.content, result.final_url or url)
+        page = await self.parser.parse_html(result.content, result.final_url or url, self._parse_pool)
         page["url"] = url
         return page
 
@@ -431,6 +474,16 @@ class AsyncCrawler:
             queue.mark_processed(url)
             if self.storage is not None:
                 await self._call_storage(self.storage.save(make_record(page, fetch)))
+            if not self.keep_pages:
+                # The page is in the storage now; keep only what stats need
+                self.processed_urls[url] = {
+                    "url": url,
+                    "title": page["title"],
+                    "depth": depth,
+                    "links_count": len(page["links"]),
+                    "errors": page["errors"],
+                }
+                fetch.content = None
 
     async def _call_storage(self, operation) -> None:
         # DataStorage logs and counts its own errors and never raises; this
@@ -510,6 +563,10 @@ class AsyncCrawler:
             await self._session.close()
         self._session = None
         await self.robots.close()
+        if self._parse_pool is not None:
+            # In a thread: shutdown waits for the worker processes to exit
+            await asyncio.to_thread(self._parse_pool.shutdown)
+            self._parse_pool = None
         if self.storage is not None:
             await self._call_storage(self.storage.close())
 
@@ -518,3 +575,21 @@ class AsyncCrawler:
 
     async def __aexit__(self, *exc) -> None:
         await self.close()
+
+
+def __getattr__(name: str):
+    # AdvancedCrawler builds on AsyncCrawler, so it lives in its own module
+    # and is imported on first use: "from crawler import AdvancedCrawler"
+    if name == "AdvancedCrawler":
+        from advanced_crawler import AdvancedCrawler
+
+        return AdvancedCrawler
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    from cli import main
+
+    sys.exit(main())

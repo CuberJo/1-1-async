@@ -1,0 +1,67 @@
+# AdvancedCrawler configuration (day 7).
+# Every key is optional; missing ones take the defaults shown here.
+# Command line options override this file:
+#   python src/crawler.py --config config.yaml --max-pages 20
+# The full reference is in docs/configuration.md.
+
+start_urls:
+  - https://quotes.toscrape.com/
+
+crawler:
+  max_pages: 100          # pages to fetch at most (failed ones count too)
+  max_depth: 2            # start URLs have depth 0
+  max_concurrent: 10      # requests in flight at once
+  max_per_domain: 5       # ... and to one domain (null = same as max_concurrent)
+  rate_limit: 5.0         # requests per second per domain, null = unlimited
+  per_domain_rate: true   # false: one limit shared by all domains
+  min_delay: 0.0          # seconds between requests to a domain, at least
+  jitter: 0.1             # plus up to this many random seconds
+  respect_robots: true    # obey robots.txt Disallow and Crawl-delay
+  user_agent: "AsyncCrawler/0.1 (+https://github.com/CuberJo)"
+  connect_timeout: 5.0
+  read_timeout: 10.0
+  total_timeout: 30.0
+  max_retries: 2          # retries of timeouts, 429 and 5xx
+  backoff_base: 0.5       # first retry after ~0.5s, then x2 each time
+  backoff_max: 30.0
+  circuit_breaker: false  # stop hitting a domain that keeps failing
+  keep_pages: true        # false: pages live only in the storage (flat memory)
+  parse_workers: 0        # > 0: parse in that many processes, ~4x faster on big crawls
+  proxy: null             # "http://user:pass@host:port"
+  headers:
+    Accept-Language: "en;q=0.9"
+  cookies: {}
+
+filters:
+  same_domain_only: true
+  include_patterns: []    # regexes; if any are given, a link must match one
+  exclude_patterns:
+    - /login
+    - \?.*sort=
+
+sitemap:
+  urls: []                # e.g. https://example.com/sitemap.xml (indexes are followed)
+  discover: false         # also read the Sitemap: lines of every start site's robots.txt
+  max_urls: 10000
+
+# One or several storages; the type follows the extension (.json .jsonl .csv .db)
+storage:
+  - path: output/pages.jsonl
+  - path: output/crawler.db
+  # - path: output/pages.csv
+  #   options: {encoding: utf-8-sig}   # Excel-friendly
+
+output:
+  stats_json: output/stats.json
+  html_report: output/report.html
+  report_title: Crawl report
+
+logging:
+  level: INFO             # log file level: DEBUG, INFO, WARNING, ERROR
+  console_level: WARNING  # the console stays quiet, the progress line shows the rest
+  file: logs/crawler.log
+  max_bytes: 5242880      # rotate at 5 MB...
+  backup_count: 3         # ...keeping crawler.log.1 .. .3
+  format: text            # or json: one JSON object per line
+
+progress_interval: 1.0    # seconds between progress updates, null = off

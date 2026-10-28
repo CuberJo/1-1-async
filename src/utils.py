@@ -1,8 +1,14 @@
 """Helpers: logging setup and report output."""
 
+import json
 import logging
+import logging.handlers
+import os
+from datetime import datetime, timezone
 
 from models import FetchResult
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -11,6 +17,66 @@ def setup_logging(level: int = logging.INFO) -> None:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+class JSONFormatter(logging.Formatter):
+    """One JSON object per line: time, level, logger, message (+ exception)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "time": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False)
+
+
+def configure_logging(
+    level: str | int = "INFO",
+    console_level: str | int = "WARNING",
+    log_file: str | None = None,
+    max_bytes: int = 5 * 1024 * 1024,
+    backup_count: int = 3,
+    fmt: str = "text",
+) -> None:
+    """Day 7: console + rotating file logging, each with its own level.
+
+    - console (stderr): console_level, short time stamps;
+    - log_file: level, full ISO time stamps, rotated at max_bytes with
+      backup_count old files kept (crawler.log.1, .2, ...); fmt="json"
+      writes one JSON object per line for log tools.
+
+    Replaces handlers set up before, so calling it twice doesn't duplicate lines.
+    """
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
+
+    console = logging.StreamHandler()
+    console.setLevel(console_level)
+    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S"))
+    root.addHandler(console)
+
+    if log_file:
+        folder = os.path.dirname(log_file)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
+        file_handler.setLevel(level)
+        if fmt == "json":
+            file_handler.setFormatter(JSONFormatter())
+        else:
+            file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root.addHandler(file_handler)
+
+    # The root lets through what the most verbose handler wants
+    root.setLevel(min(h.level for h in root.handlers))
 
 
 def print_report(results: list[FetchResult]) -> None:

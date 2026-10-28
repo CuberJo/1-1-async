@@ -3,7 +3,10 @@
 import asyncio
 import copy
 import logging
+import pickle
 import re
+from concurrent.futures import Executor
+from concurrent.futures.process import BrokenProcessPool
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound, Tag
@@ -63,9 +66,19 @@ class HTMLParser:
             logger.warning("Parser %r is not installed, falling back to html.parser", self.features)
             return BeautifulSoup(html, "html.parser")
 
-    async def parse_html(self, html: str, url: str) -> dict:
-        """Parse a page. Never raises: failed parts are listed in result["errors"]."""
+    async def parse_html(self, html: str, url: str, executor: Executor | None = None) -> dict:
+        """Parse a page. Never raises: failed parts are listed in result["errors"].
+
+        executor: e.g. a ProcessPoolExecutor to parse on other CPU cores; if
+        it breaks, parsing falls back to a thread.
+        """
         # Parsing is CPU-bound, so it runs in a thread and doesn't block the event loop
+        if executor is not None:
+            try:
+                return await asyncio.get_running_loop().run_in_executor(executor, self._parse_sync, html, url)
+            except (BrokenProcessPool, pickle.PicklingError, RuntimeError) as e:
+                # RuntimeError: the executor was shut down
+                logger.warning("Parse executor failed (%s), parsing in a thread: %s", type(e).__name__, url)
         return await asyncio.to_thread(self._parse_sync, html, url)
 
     @staticmethod

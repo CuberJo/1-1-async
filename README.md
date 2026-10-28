@@ -67,6 +67,30 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 - `MultiStorage(*storages)` sends every record to several storages, so one crawl can produce every format.
 - `AsyncCrawler(storage=...)` saves every successfully processed page. `crawl()` flushes the storage at the end, and `crawler.close()` closes it. Even a broken storage doesn't stop the crawl: `crawler.storage_errors` counts what it raised. `get_stats()["storage"]` has `saved`, `failed`, `batches`, `retries`, `buffered` and `write_time`. `FetchResult` has a new `content_type` field.
 
+## Day 7 — advanced features and integration
+
+- `AdvancedCrawler` ([src/advanced_crawler.py](src/advanced_crawler.py), also `from crawler import AdvancedCrawler`) puts everything from days 1–6 together and adds configuration, sitemaps, statistics, reports, live progress and logging. `AdvancedCrawler.from_config("config.yaml")`, `await crawl()` (arguments override the config), `get_stats()`, `export_to_json(filename)`, `export_to_html_report(filename)`, `await run()` (crawl + the files named in the config), `await close()`.
+- `SitemapParser` ([src/sitemap_parser.py](src/sitemap_parser.py)): `await fetch_sitemap(url) -> list[str]` handles regular sitemaps and sitemap indexes. Indexes are followed recursively with the children loaded concurrently, and cycles are skipped. It also reads `.xml.gz` and plain-text sitemaps. `find_sitemaps(site)` reads the `Sitemap:` lines of robots.txt and falls back to `/sitemap.xml`. Pages from sitemaps become start URLs after the same filters as discovered links.
+- `CrawlerStats` ([src/crawler_stats.py](src/crawler_stats.py)) tracks pages, successes, failures, robots.txt blocks, average speed, average response time, status codes, top domains, errors by type, depths, a per-second timeline, the slowest pages and the run time. Memory doesn't grow with the page count.
+- The HTML report ([src/report.py](src/report.py)) is one self-contained file. It has stat tiles, a throughput chart, bar charts of status codes, domains, error types and depths, and tables of domains, slowest pages, failed URLs and settings. Every chart shows a tooltip on hover. It follows the light/dark theme and works on phones.
+- Configuration in YAML or JSON ([src/config.py](src/config.py), example in [config.yaml](config.yaml), guide in [docs/configuration.md](docs/configuration.md)). Unknown keys and wrong types are errors that name the key, for example `crawler.max_pages must be an integer`.
+- The command line ([src/cli.py](src/cli.py)) is `python src/crawler.py --urls ... --max-pages ... --max-depth ... --output ... --config ... --respect-robots ... --rate-limit ...`, plus `--sitemap`, `--stats`, `--report`, `--include` / `--exclude`, `--proxy`, `--parse-workers`, `-v` / `-q`.
+- Logging (`utils.configure_logging`) goes to the console and to a rotating file, each with its own level. The file gets full timestamps and can be text or JSON Lines.
+- Progress shows a bar, percent, current speed in pages/s, ETA, active requests, queue, errors and blocks. On a terminal it redraws in place; in a pipe it prints one line per update.
+- New `AsyncCrawler` options: `proxy`, `headers`, `cookies` (a cookie jar per session, so logins work), `keep_pages=False` (pages live only in the storage, so memory stays flat), and `parse_workers=N` (parse in N processes).
+- Performance ([src/benchmark.py](src/benchmark.py)), on a local site with 50 ms latency per page, concurrency 20 and 8 CPUs:
+
+  | run | 100 pages | 500 pages | 1000 pages | peak memory, 1000 pages |
+  |---|---|---|---|---|
+  | sync (urllib, same parser) | 8.9 s | 45.7 s | – | – |
+  | async | 1.7 s (×5.1) | 8.3 s (×5.5) | 16.5 s, 61 p/s | 34.7 MB |
+  | async, `parse_workers=7` | 2.6 s | 4.1 s (×11.2) | 5.8 s, 171 p/s | 21.6 MB* |
+  | async + storage, `keep_pages=False` | 1.9 s | 8.6 s | 16.9 s | 19.0 MB |
+
+  The bottleneck was HTML parsing. It costs ~10 ms of CPU per page, and the parse threads share one core under the GIL. Moving it to a process pool removed that limit. Starting the processes takes ~1 s, so it is off by default. Details are in [docs/algorithm.md](docs/algorithm.md). *Main process only; the workers hold their own memory.
+
+API reference: [docs/api.md](docs/api.md).
+
 ## Structure
 
 ```
@@ -77,7 +101,16 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── polite_demo.py  demo: robots.txt, rate limiting, delay statistics
 │   ├── retry_demo.py   demo: error types, retries, circuit breaker, error report
 │   ├── storage_demo.py demo: saving to JSON/CSV/SQLite, reading back, queries, benchmark
-│   ├── crawler.py      AsyncCrawler class
+│   ├── advanced_demo.py demo: AdvancedCrawler from a config, sitemaps, report (day 7)
+│   ├── benchmark.py    performance: sync vs async, memory, 100/500/1000 pages
+│   ├── crawler.py      AsyncCrawler class; the command line when run as a script
+│   ├── advanced_crawler.py  AdvancedCrawler: all components together
+│   ├── cli.py          argparse command line
+│   ├── config.py       CrawlerConfig: YAML/JSON settings, validation
+│   ├── sitemap_parser.py    SitemapParser
+│   ├── crawler_stats.py     CrawlerStats, JSON export
+│   ├── report.py       HTML report
+│   ├── progress.py     ProgressMonitor: progress bar, speed, ETA
 │   ├── crawler_queue.py     CrawlerQueue class
 │   ├── semaphore_manager.py SemaphoreManager class
 │   ├── rate_limiter.py RateLimiter, exponential backoff
@@ -89,7 +122,7 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── url_filter.py   URLFilter, URL canonicalization
 │   ├── html_parser.py  HTMLParser class
 │   ├── models.py       FetchResult
-│   └── utils.py        logging setup and report output
+│   └── utils.py        logging setup (console + rotating file) and report output
 ├── tests/
 │   ├── test_crawler.py
 │   ├── test_parser.py
@@ -99,9 +132,16 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── test_robots.py  robots.txt parsing, matching, loading, cache
 │   ├── test_polite_crawl.py  crawler + robots.txt, rate limits, User-Agent, retries
 │   ├── test_retry.py   error classes, retry strategies, backoff, circuit breaker, error stats
-│   └── test_storage.py JSON/CSV/SQLite round trips, encodings, batches, write errors, crawler
+│   ├── test_storage.py JSON/CSV/SQLite round trips, encodings, batches, write errors, crawler
+│   ├── test_sitemap.py sitemaps: urlset, index, recursion, gzip, errors, discovery
+│   ├── test_stats.py   statistics, JSON/HTML export, progress line, logging
+│   ├── test_config.py  config files, validation, command line options
+│   └── test_advanced.py AdvancedCrawler: sitemaps, exports, proxy, cookies, CLI end to end
+├── config.yaml         example configuration
 └── docs/
-    └── algorithm.md
+    ├── algorithm.md
+    ├── configuration.md
+    └── api.md
 ```
 
 ## Installation
@@ -126,8 +166,17 @@ python src/retry_demo.py   # day 5 demo on local sites with errors, saves output
 python src/retry_demo.py https://httpbin.org/status/503 https://httpbin.org/status/404 --read-timeout 2
 python src/storage_demo.py # day 6 demo on a local site: output/pages.jsonl, .json, .csv, crawler.db
 python src/storage_demo.py https://quotes.toscrape.com/ --max-pages 20 --benchmark 0
+python src/advanced_demo.py # day 7 demo on a local site: sitemaps, retries, output/report.html
+python src/crawler.py --urls https://example.com --max-pages 100 --output output/results.json
+python src/crawler.py --config config.yaml   # everything from the config file
+python src/crawler.py --config config.yaml --max-pages 20 --report output/report.html -v
+python src/crawler.py --sitemap https://example.com/sitemap.xml --max-depth 0 --output output/pages.csv
+python src/crawler.py --help
+python src/benchmark.py    # performance tests, saves output/benchmark.json (~3 min)
 pytest                     # tests (local server, no internet needed)
 ```
+
+Command line options override the config file. `--output` picks the format from the extension: `.json`, `.jsonl`, `.csv`, `.db`. The exit code is 0 on success, 1 when no page could be fetched and 2 for invalid options.
 
 ## Example
 
@@ -217,4 +266,47 @@ async def main():
         print(await db.summary())
         print([p["title"] for p in await db.find(title_contains="Quotes", limit=5)])
     pages = await JSONStorage("output/results.json").load()  # crawled_at is a datetime again
+```
+
+```python
+import asyncio
+from crawler import AdvancedCrawler
+
+async def main():
+    crawler = AdvancedCrawler.from_config("config.yaml")
+
+    await crawler.crawl()
+
+    stats = crawler.get_stats()
+    print(f"Обработано: {stats['total_pages']} страниц")
+    print(f"Успешно: {stats['successful']}")
+    print(f"Ошибок: {stats['failed']}")
+
+    crawler.export_to_html_report("report.html")
+    await crawler.close()
+
+asyncio.run(main())
+```
+
+```python
+from config import CrawlerConfig
+from sitemap_parser import SitemapParser
+
+async def main():
+    # Settings in code instead of a file
+    config = CrawlerConfig.from_dict({
+        "start_urls": ["https://quotes.toscrape.com/"],
+        "crawler": {"max_pages": 50, "rate_limit": 2, "keep_pages": False},
+        "filters": {"exclude_patterns": ["/login"]},
+        "storage": ["output/pages.jsonl"],
+    })
+    async with AdvancedCrawler(config) as crawler:
+        await crawler.crawl(max_depth=1)  # arguments override the config
+        crawler.export_to_json("output/stats.json")
+        print(crawler.get_stats()["top_domains"])
+
+    # Sitemaps on their own
+    async with SitemapParser() as sitemaps:
+        urls = await sitemaps.fetch_sitemap("https://www.python.org/sitemap.xml")
+        print(len(urls), sitemaps.errors)
 ```

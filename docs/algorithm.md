@@ -268,3 +268,93 @@ A retry gets the same batch, so a write must be repeatable:
 
 Batches turn N writes into N / batch_size: one `write` + `flush` per batch for files, one transaction instead of N for SQLite. File I/O runs in the `aiofiles` thread pool and SQLite in the `aiosqlite` thread, so the event loop keeps fetching pages during writes. The demo's benchmark compares `batch_size=1` with `batch_size=100` (on the author's machine: JSON Lines ×13, CSV ×9, SQLite ×4).
 
+
+## Day 7 — integration, sitemaps, statistics, configuration
+
+### Components
+
+- `AdvancedCrawler` ([src/advanced_crawler.py](../src/advanced_crawler.py)) is a subclass of `AsyncCrawler`. It builds the crawler, storages and logging from a `CrawlerConfig` and hooks into three methods: `_fetch` (statistics), `_robots_allowed` (robots.txt blocks) and `_print_progress` (the progress line).
+- `SitemapParser` ([src/sitemap_parser.py](../src/sitemap_parser.py)), `CrawlerStats` ([src/crawler_stats.py](../src/crawler_stats.py)), `render_html_report` ([src/report.py](../src/report.py)), `CrawlerConfig` ([src/config.py](../src/config.py)), `ProgressMonitor` ([src/progress.py](../src/progress.py)), `configure_logging` ([src/utils.py](../src/utils.py)), the command line ([src/cli.py](../src/cli.py)).
+- `crawler.py` exports `AdvancedCrawler` through a module-level `__getattr__`, which imports it on first use. A plain import would be circular, because `advanced_crawler` imports `crawler`. Run as a script, `crawler.py` calls `cli.main()`.
+
+### `AdvancedCrawler.crawl()`
+
+1. Arguments left as `None` take their values from the config.
+2. `stats.start()` resets the counters, and a new `ProgressMonitor` gets `max_pages`.
+3. Sitemaps: with `sitemap.discover`, `find_sitemaps` runs for every start URL. Every sitemap goes through `fetch_sitemap`, and every URL it returns is normalized, canonicalized and checked by a `URLFilter` built from the same `same_domain_only` / `include` / `exclude` settings. The sitemaps' own hosts count as start sites. Sitemap pages go after the given start URLs, duplicates removed.
+4. `AsyncCrawler.crawl()` runs with that list. Each start URL gets depth 0 and bypasses the filters, which is why the sitemap pages were filtered in step 3.
+5. `finally: stats.stop()` freezes `uptime`, so the speed and run time stay correct after the crawl, and after an error too.
+
+### Statistics
+
+- `_fetch` calls `stats.record(result, depth)` after every fetch, and that includes `fetch_url` / `fetch_urls` outside a crawl. Depth comes from the queue.
+- In `crawl()` the robots.txt check comes before `_fetch`, so blocks are counted in `_robots_allowed`, once per URL, when it returns `False` for a URL not yet in `blocked_urls`. `_fetch` skips blocked results so nothing is counted twice.
+- `record` updates counters only, so memory doesn't grow with the page count. The counters are per status code, error type, domain, depth, content type and second of the run, plus the `slowest_n` slowest pages. A new URL enters the slowest list only when it is slower than its last entry. The sort is stable, so on equal times the earlier page stays.
+- `total_pages = successful + failed`. A blocked URL is not a request. `avg_speed = total_pages / uptime`. `avg_response_time` is the mean of `FetchResult.elapsed`, which includes the retries.
+- `get_stats()` is `{**AsyncCrawler.get_stats(), **stats.to_dict()}`. The two share only `failed`, and in a crawl both count the same pages.
+
+### HTML report
+
+`render_html_report(stats_dict, title, extra)` returns one string: inline CSS, inline SVG for the timeline, HTML rows for the bar charts and ~10 lines of JS for tooltips. Every chart item carries a `data-tip`, and a single floating box follows the pointer. The bar charts are HTML rather than SVG so that their text keeps its size in a narrow card; an SVG `viewBox` would scale it down with the chart. A run longer than 60 s is grouped into buckets of seconds, so the timeline never has more than ~60 columns. Status-code bars use the status colors (2xx good, 4xx serious, 5xx and "no response" critical), always with the code as the label and a legend. Every chart also has a table. Colors are CSS variables with a separate dark set under `prefers-color-scheme: dark`. All text from the crawl (URLs, titles, errors) is HTML-escaped.
+
+### Configuration
+
+`CrawlerConfig.from_dict` walks the dataclasses with `typing.get_type_hints`:
+
+- an unknown key raises `ConfigError("unknown option section.key (known: ...)")`;
+- `int` doesn't accept `bool` or `"5"`, `float` takes an int and converts it, `bool` takes `true` / `false` only, `X | None` takes `null`, and lists and dicts are checked item by item with the path in the message (`start_urls[0]`);
+- `validate()` then checks ranges, compiles the regexes, upper-cases the log levels and infers each storage's `type` from its extension.
+
+YAML is read with `yaml.safe_load`, which never builds arbitrary objects. The CLI loads the file and then overwrites only the options that were given: argparse defaults are `None`, and `BooleanOptionalAction` gives `--respect-robots` / `--no-respect-robots`.
+
+### Sitemaps (`SitemapParser`)
+
+- `parse_sitemap(bytes)`: gzip is recognized by its magic bytes `1f 8b`. A `.gz` file arrives still packed, while `Content-Encoding: gzip` is undone by aiohttp. Content that doesn't start with `<` is a text sitemap, one URL per line. XML is parsed by `ElementTree` (expat), which doesn't load external entities and limits entity expansion. The namespace is ignored (`{ns}loc` → `loc`), so sitemaps with a wrong or missing namespace still parse. Only the first `<loc>` directly inside `<url>` / `<sitemap>` counts, so `image:loc` and the like are skipped.
+- `fetch_sitemap` → `_collect(url, depth, urls, seen)`: `seen` is a new set for each `fetch_sitemap` call. Every sitemap URL goes into it before its request, which makes a cycle or a repeated child a no-op, and a later call can fetch the same sitemap again. `loaded` and `errors` add up across calls until `reset()`, which `AdvancedCrawler.crawl()` calls at the start of each crawl, so a report shows only that crawl's sitemap errors. An index loads its children with `asyncio.gather`. Each child fills its own dict, and the dicts are merged in index order, so the result doesn't depend on which download finished first. Nesting deeper than `max_depth` is refused. The download is limited to 50 MiB, the protocol's maximum.
+- Errors (HTTP, network, timeout, invalid XML, a broken gzip) are caught per sitemap, logged and stored in `errors`. The rest of the sitemaps are still used.
+
+### Progress
+
+`ProgressMonitor.snapshot`: `target = min(max_pages, done + queued + in_progress)`, because a crawl can't fetch more pages than it has found. The speed is measured between two updates and smoothed: `0.3 * new + 0.7 * old`. ETA is `(target - done) / speed`. When the stream is a terminal, the line is redrawn with `\r` and padded to the length of the previous one. Otherwise each update is its own line, so logs and CI output stay readable. A stream whose encoding can't print `█` (cp1251, cp866) gets `#` and `-`.
+
+### Logging
+
+`configure_logging` removes the root handlers and adds a `StreamHandler` (stderr) and a `RotatingFileHandler`, each with its own level. The root level is the lower of the two, so the file can get DEBUG while the console shows only warnings. The CLI default is a quiet console with the progress line on stdout and full detail in `logs/crawler.log`. `JSONFormatter` writes `time` (UTC ISO with milliseconds), `level`, `logger`, `message` and `exception`.
+
+### Sessions, proxy, memory
+
+- `proxy`, `headers` and `cookies` are set on the `ClientSession`, so robots.txt and sitemap requests, which share the session, use them too. The cookie jar is `CookieJar(unsafe=True)`. The default jar drops cookies of hosts addressed by IP, which would break sessions on intranet sites.
+- `keep_pages=False`: after a page is saved to the storage, `processed_urls[url]` is replaced by a short summary and `results[url].content` (the HTML) is dropped. In the benchmark, peak memory for 1000 pages went from 34.7 to 19.0 MB and barely grows from 500 to 1000 pages (17.5 → 19.0 MB).
+
+### Performance
+
+[src/benchmark.py](../src/benchmark.py) starts a local site in a separate process, so the server doesn't compete with the crawler for CPU. The pages are ~10 KB with text, a table, a list and 13 links, and every response waits 50 ms. The sync baseline does the same breadth-first crawl with `urllib` and the same `HTMLParser`. Each case runs twice: once for time and once under `tracemalloc` for peak memory, because tracemalloc slows Python down.
+
+The first measurement: async was 5.4× faster than sync, but it stayed at ~60 pages/s for 100, 500 and 1000 pages. With 20 concurrent requests and 50 ms latency the network allows 400 pages/s, so the limit was not I/O. Profiling found the cause:
+
+- one `_parse_sync` takes ~10 ms of CPU: building the BeautifulSoup tree ~3 ms, `extract_text` ~3 ms, tables and lists ~1.2 ms each;
+- `asyncio.to_thread` runs it in the default pool of up to 12 threads, which share one core because of the GIL. The parse threads compete with the event loop: in the profile one parse took ~400 ms of wall time instead of 10 ms.
+
+Experiment, 1000 pages:
+
+| Parsing in | pages/s |
+|---|---|
+| `asyncio.to_thread` (default pool) | 61.6 |
+| `ThreadPoolExecutor(1)` | 73.0 |
+| `ThreadPoolExecutor(2)` | 62.4 |
+| `ProcessPoolExecutor(2)` | 165.9 |
+| `ProcessPoolExecutor(4)` | 222.6 |
+| `ProcessPoolExecutor(7)` | 247.9 |
+
+Threads can't fix a CPU limit under the GIL; processes can. Hence `parse_workers=N`. `HTMLParser.parse_html(html, url, executor)` sends `_parse_sync` to the pool. Only the HTML string goes out and only the parsed dict comes back, both small to pickle. If the pool breaks or has been shut down, parsing falls back to a thread with a warning. The pool is created on first use and shut down in `close()`. On Windows a worker starts with a fresh interpreter (spawn) and imports bs4 and lxml, which takes ~1 s. That's why the option is off by default: 100 pages take 2.6 s with the pool and 1.7 s without it.
+
+Final results (8 CPUs, `parse_workers=7`):
+
+| run | 100 pages | 500 pages | 1000 pages | peak MB (1000) |
+|---|---|---|---|---|
+| sync | 8.93 s | 45.71 s | – | – |
+| async | 1.74 s | 8.26 s | 16.48 s | 34.7 |
+| async, parse_workers=7 | 2.56 s | 4.07 s | 5.84 s | 21.6 (main process) |
+| async + storage, keep_pages=False | 1.90 s | 8.59 s | 16.93 s | 19.0 |
+
+Scalability: plain async holds a flat ~60 pages/s from 100 to 1000 pages, so the time grows linearly. With the pool the speed rises with size (39 → 123 → 171 pages/s) as the start-up cost is spread over more pages. The memory per page drops (97 → 35 KB/page for async) because the fixed cost of imports and the session is shared.
