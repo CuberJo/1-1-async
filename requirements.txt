@@ -1,5 +1,6 @@
 aiohttp>=3.9
 aiofiles>=23.0
+aiosqlite>=0.20
 beautifulsoup4>=4.12
 lxml>=5.0
 pytest>=8.0

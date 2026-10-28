@@ -1,7 +1,8 @@
 """Asynchronous HTTP client built on aiohttp (day 1) with HTML parsing (day 2),
 a queue-driven crawl with depth and concurrency control (day 3), polite
-crawling: rate limits, robots.txt (day 4) and error handling: classified
-errors, retry strategies, a circuit breaker, error statistics (day 5)."""
+crawling: rate limits, robots.txt (day 4), error handling: classified
+errors, retry strategies, a circuit breaker, error statistics (day 5) and
+saving pages to JSON, CSV or SQLite (day 6)."""
 
 import asyncio
 import itertools
@@ -19,6 +20,7 @@ from rate_limiter import RateLimiter
 from retry_strategy import RetryStrategy
 from robots_parser import RobotsParser
 from semaphore_manager import SemaphoreManager
+from storage import DataStorage, make_record
 from url_filter import URLFilter, canonicalize, domain_of
 
 logger = logging.getLogger("crawler")
@@ -46,6 +48,11 @@ class AsyncCrawler:
       attempts get longer timeouts (RetryStrategy.timeout_growth);
     - circuit_breaker: a CircuitBreaker; requests to a domain that keeps
       failing are refused (CircuitOpenError) until it recovers.
+
+    Day 6 options:
+    - storage: a DataStorage; every processed page is saved to it as a
+      standard record (make_record). crawl() flushes it at the end, close()
+      closes it. A storage error never stops the crawl.
     """
 
     def __init__(
@@ -69,6 +76,7 @@ class AsyncCrawler:
         backoff_max: float = 30.0,
         retry_strategy: RetryStrategy | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        storage: DataStorage | None = None,
     ):
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -121,6 +129,10 @@ class AsyncCrawler:
             jitter=jitter,
         )
         self.circuit_breaker = circuit_breaker
+
+        # Saving (day 6)
+        self.storage = storage
+        self.storage_errors = 0  # exceptions a storage raised despite its contract
 
     async def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily, inside a running event loop
@@ -219,6 +231,7 @@ class AsyncCrawler:
                 async with session.get(url, headers=headers, timeout=timeout) as response:
                     result.status = response.status
                     result.final_url = str(response.url)
+                    result.content_type = response.content_type
                     result.content = await response.text()
             except Exception as exc:
                 error = classify_exception(exc, url)
@@ -325,6 +338,7 @@ class AsyncCrawler:
         self.skipped = {"filtered": 0, "too_deep": 0}
         self._pages_taken = 0
         self.blocked_urls = set()
+        self.storage_errors = 0
         self.retry_strategy.stats.reset()
         self.rate_limiter.reset_stats()
         url_filter = URLFilter(same_domain_only, include_patterns, exclude_patterns)
@@ -356,6 +370,9 @@ class AsyncCrawler:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._finished_at = time.perf_counter()
+            # Batches still buffered go to disk now, not only on close()
+            if self.storage is not None:
+                await self._call_storage(self.storage.flush())
 
         if self.progress_interval:
             self._print_progress()
@@ -412,6 +429,17 @@ class AsyncCrawler:
                     # Shallower pages first: priority falls with depth
                     queue.add_url(link, priority=-(depth + 1), depth=depth + 1)
             queue.mark_processed(url)
+            if self.storage is not None:
+                await self._call_storage(self.storage.save(make_record(page, fetch)))
+
+    async def _call_storage(self, operation) -> None:
+        # DataStorage logs and counts its own errors and never raises; this
+        # guards against a storage of your own that does
+        try:
+            await operation
+        except Exception:
+            logger.exception("Storage error")
+            self.storage_errors += 1
 
     def get_stats(self) -> dict:
         """Crawl progress: queue counters, speed, concurrency and request rate."""
@@ -432,6 +460,8 @@ class AsyncCrawler:
             "retries": self.retries,
             "errors": self.retry_strategy.stats.to_dict(),
             "circuits": self.circuit_breaker.get_stats() if self.circuit_breaker else {},
+            "storage": self.storage.get_stats() if self.storage else {},
+            "storage_errors": self.storage_errors,
         }
 
     @property
@@ -465,7 +495,8 @@ class AsyncCrawler:
             f"[{s['elapsed']:6.1f}s] processed: {s['processed']:4} | queue: {s['queued']:4} | "
             f"active: {s['concurrency']['active']:3} | errors: {s['failed']:3} | "
             f"blocked: {s['robots_blocked']:3} | {s['pages_per_sec']:.2f} pages/s | "
-            f"{s['rate']['current_rps']:.2f} req/s | avg gap: {s['rate']['avg_gap']:.2f}s",
+            f"{s['rate']['current_rps']:.2f} req/s | avg gap: {s['rate']['avg_gap']:.2f}s"
+            + (f" | saved: {s['storage']['saved']}" if self.storage else ""),
             flush=True,
         )
 
@@ -479,6 +510,8 @@ class AsyncCrawler:
             await self._session.close()
         self._session = None
         await self.robots.close()
+        if self.storage is not None:
+            await self._call_storage(self.storage.close())
 
     async def __aenter__(self) -> "AsyncCrawler":
         return self

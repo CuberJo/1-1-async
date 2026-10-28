@@ -225,3 +225,46 @@ State per domain: `closed` → `open` → `half_open` → `closed` / `open`.
 
 Only `TransientError` and `NetworkError` count as failures: a 404 or a parse error means the server answered. The check runs inside the semaphores, after the rate limiter, right before the request: while a task waited for its slot, the others may have found the domain down.
 
+## Day 6 — saving data
+
+### Components
+
+- `DataStorage` ([src/storage.py](../src/storage.py)) — base class: buffer, batches, retries, statistics.
+- `JSONStorage`, `CSVStorage` — files through `aiofiles`, built on `FileStorage`.
+- `SQLiteStorage` — `aiosqlite` (a connection in its own thread).
+- `MultiStorage` — the same records to several storages.
+
+### The record
+
+`make_record(page, fetch)` takes the standard fields from the parsed page (`url`, `title`, `text`, `links`, `metadata`) and from `FetchResult` (`status_code`, `content_type`). `crawled_at` is the current UTC time. `normalize_record` runs on every `save()`: it fills in missing fields, converts `status_code` to int and an ISO string `crawled_at` to a datetime, and keeps extra keys after the standard ones. A record without a url is rejected. `decode_record` reverses what a format did to the record (JSON strings back to lists and dicts, ISO strings back to datetime, empty CSV cells back to `None`). So `load()` returns the same records from every format, and the demo and tests compare them directly.
+
+### `save` → `flush` → `_write_with_retry`
+
+1. `save(data)`: normalize. An invalid record, or a closed storage, is counted as failed, logged, and `save` returns `False`. Otherwise the record is appended to the buffer.
+2. When the buffer reaches `batch_size`, `flush()` runs: under an `asyncio.Lock` it takes the whole buffer and writes it. Records saved during the write go into the next round of the same `flush`. Workers whose save fills the buffer wait for the lock, which gives backpressure: the buffer can't grow without bound when writes are slow.
+3. `_write_with_retry(batch)`: call `_write_batch`. On any `Exception`, sleep `retry_delay * 2**attempt` and repeat, up to `max_retries` times. Then count the batch as failed and log its first URLs. Nothing is raised.
+
+### Retries without duplicates
+
+A retry gets the same batch, so a write must be repeatable:
+
+- Files: `FileStorage` keeps one `r+b`/`w+b` handle and an end offset `_end`. A batch is `seek(_end)`, `write(data + tail)`, `truncate()`, `flush()`, and only then is `_end += len(data)`. If a write fails halfway, the retry starts at the same offset and overwrites the partial data.
+- JSON array: the file is always `[` + elements + `\n]\n`. The closing bracket is the `tail`, and the next batch overwrites it starting with `,\n`. That is why the file is valid JSON after every batch. With `append=True` the bracket is found in the last 4 KB of the file.
+- JSON Lines: one `json.dumps` per line (`ensure_ascii=False`). When appending to a file whose last line was cut off, a newline is added first.
+- CSV: rows are written by `csv.DictWriter` into a `StringIO` and then encoded with `str.encode(encoding, errors)`. Codecs with a BOM (`utf-8-sig`, `utf-16`) add it on every `encode`, so it is stripped from any batch that doesn't start at offset 0. The header is written when `_end == 0`. The column list comes from `fieldnames`, then from the first line of an appended file, then from the keys of the first record.
+- SQLite: `executemany(UPSERT)` + `commit()` is one transaction; on an error, `rollback()`. A retry finds no rows from the failed attempt, and `ON CONFLICT(url) DO UPDATE` covers the rest.
+
+### SQLite schema
+
+`pages(id, url UNIQUE, domain, title, text, links JSON, metadata JSON, crawled_at ISO UTC, status_code, content_type)` with indexes on `domain`, `status_code`, `crawled_at` and `title`. `crawled_at` is converted to UTC before it is written, so text comparison matches time order. `find()` builds `WHERE` from parameters only (`LIKE` with `%` and `_` escaped). `summary()` uses `json_array_length(links)`. The connection runs with `journal_mode=WAL` and `synchronous=NORMAL`.
+
+### Crawler integration
+
+- `_worker` calls `storage.save(make_record(page, fetch))` after `mark_processed`, for successful pages only.
+- `crawl()` calls `storage.flush()` in its `finally`, so the data is on disk when `crawl()` returns. `close()` closes the storage.
+- Both calls go through `_call_storage`, which catches and counts exceptions (`storage_errors`). That matters only for a storage that breaks the "never raise" contract.
+
+### Performance
+
+Batches turn N writes into N / batch_size: one `write` + `flush` per batch for files, one transaction instead of N for SQLite. File I/O runs in the `aiofiles` thread pool and SQLite in the `aiosqlite` thread, so the event loop keeps fetching pages during writes. The demo's benchmark compares `batch_size=1` with `batch_size=100` (on the author's machine: JSON Lines ×13, CSV ×9, SQLite ×4).
+

@@ -18,6 +18,7 @@ class FetchResult:
     blocked: bool = False  # disallowed by robots.txt, never requested
     retryable: bool = False  # the error is temporary (timeout, 429, 5xx...)
     retry_after: float | None = None  # seconds, from the Retry-After header
+    content_type: str | None = None  # "text/html", without the charset
 
     @property
     def ok(self) -> bool:

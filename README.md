@@ -55,6 +55,18 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 - `CircuitBreaker(failure_rate=0.5, min_requests=5, window=10, recovery_timeout=30)` ([src/circuit_breaker.py](src/circuit_breaker.py)) — per domain: when the share of failures among the last `window` requests reaches `failure_rate`, the domain is blocked for `recovery_timeout` seconds, then one trial request decides whether it is back.
 - `AsyncCrawler` has new options `retry_strategy` and `circuit_breaker`. Without a strategy it builds one from the day 4 `max_retries` / `backoff_base` / `backoff_max`, so the defaults still don't retry. Repeated attempts get `timeout_growth`× longer timeouts. `FetchResult` has `error_type`; `get_stats()` has `errors` and `circuits`; `get_error_report()` returns stats, failed URLs and the attempts log for saving. `fetch_once(url)` makes one request and raises the classified error — for a strategy of your own.
 
+## Day 6 — saving data: JSON, CSV, SQLite
+
+[src/storage.py](src/storage.py):
+
+- The standard record is `url`, `title`, `text`, `links`, `metadata`, `crawled_at` (datetime), `status_code`, `content_type`. `make_record(page, fetch)` builds one from a parsed page; `normalize_record(data)` fills missing fields and checks the types.
+- `DataStorage` is the abstract base class. `async save(data)` adds a record to a buffer and writes a full buffer (`batch_size`) as one batch. `async flush()` writes whatever is buffered, `async close()` flushes and releases the file or connection, and `async load()` / `iter_records()` read the records back. A failed write is retried `max_retries` times after `retry_delay * 2**attempt` seconds, then logged and counted in `stats["failed"]`. `save()` never raises. Subclasses implement `_write_batch(records)`.
+- `JSONStorage(path, indent=None, lines=None, append=False, batch_size=20)` writes JSON Lines (the default for `.jsonl`, one record per line, streams any size) or a JSON array (`indent=2` for pretty output). The array is valid after every batch, not only after `close()`. Files are written with `aiofiles`.
+- `CSVStorage(path, encoding="utf-8", errors="replace", delimiter=",", fieldnames=None, append=False, batch_size=50)` takes its header from the first record, or from the existing file when appending. Lists and dicts are stored as JSON. It supports any encoding (`utf-8-sig` for Excel, `cp1251`, `utf-16`) and writes the BOM once. Commas, quotes and line breaks are quoted, and NUL characters are removed.
+- `SQLiteStorage(path, batch_size=100)` uses `aiosqlite`. `init_db()` creates the `pages` table and indexes on `domain`, `status_code`, `crawled_at` and `title`. A batch is one `executemany` in one transaction. `url` is unique, so a page crawled again updates its row. Query it with `get(url)`, `count()`, `find(domain=, status_code=, title_contains=, since=, limit=)` and `summary()` (counts by domain, status and content type, plus the pages with the most links).
+- `MultiStorage(*storages)` sends every record to several storages, so one crawl can produce every format.
+- `AsyncCrawler(storage=...)` saves every successfully processed page. `crawl()` flushes the storage at the end, and `crawler.close()` closes it. Even a broken storage doesn't stop the crawl: `crawler.storage_errors` counts what it raised. `get_stats()["storage"]` has `saved`, `failed`, `batches`, `retries`, `buffered` and `write_time`. `FetchResult` has a new `content_type` field.
+
 ## Structure
 
 ```
@@ -64,6 +76,7 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── crawl_demo.py   demo: crawling a site with live progress
 │   ├── polite_demo.py  demo: robots.txt, rate limiting, delay statistics
 │   ├── retry_demo.py   demo: error types, retries, circuit breaker, error report
+│   ├── storage_demo.py demo: saving to JSON/CSV/SQLite, reading back, queries, benchmark
 │   ├── crawler.py      AsyncCrawler class
 │   ├── crawler_queue.py     CrawlerQueue class
 │   ├── semaphore_manager.py SemaphoreManager class
@@ -72,6 +85,7 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── errors.py       error classes and classification
 │   ├── retry_strategy.py    RetryStrategy, ErrorPolicy, RetryStats
 │   ├── circuit_breaker.py   CircuitBreaker
+│   ├── storage.py      DataStorage, JSONStorage, CSVStorage, SQLiteStorage, MultiStorage
 │   ├── url_filter.py   URLFilter, URL canonicalization
 │   ├── html_parser.py  HTMLParser class
 │   ├── models.py       FetchResult
@@ -84,7 +98,8 @@ The `HTMLParser` class (BeautifulSoup + lxml):
 │   ├── test_rate_limiter.py  rate limits, delays, jitter, backoff
 │   ├── test_robots.py  robots.txt parsing, matching, loading, cache
 │   ├── test_polite_crawl.py  crawler + robots.txt, rate limits, User-Agent, retries
-│   └── test_retry.py   error classes, retry strategies, backoff, circuit breaker, error stats
+│   ├── test_retry.py   error classes, retry strategies, backoff, circuit breaker, error stats
+│   └── test_storage.py JSON/CSV/SQLite round trips, encodings, batches, write errors, crawler
 └── docs/
     └── algorithm.md
 ```
@@ -109,6 +124,8 @@ python src/polite_demo.py  # day 4 demo on a local site with robots.txt (no inte
 python src/polite_demo.py https://docs.python.org/3/ --max-pages 15 --rps 1
 python src/retry_demo.py   # day 5 demo on local sites with errors, saves output/error_report.json
 python src/retry_demo.py https://httpbin.org/status/503 https://httpbin.org/status/404 --read-timeout 2
+python src/storage_demo.py # day 6 demo on a local site: output/pages.jsonl, .json, .csv, crawler.db
+python src/storage_demo.py https://quotes.toscrape.com/ --max-pages 20 --benchmark 0
 pytest                     # tests (local server, no internet needed)
 ```
 
@@ -181,4 +198,23 @@ async def main():
         html = await retry_strategy.execute_with_retry(crawler.fetch_once, "https://example.com")
     errors = crawler.get_stats()["errors"]
     print(errors["errors_by_type"], errors["successful_retries"], list(errors["permanent_errors"]))
+```
+
+```python
+from storage import CSVStorage, JSONStorage, MultiStorage, SQLiteStorage
+
+async def main():
+    storage = MultiStorage(
+        JSONStorage("output/results.json", indent=2),
+        CSVStorage("output/results.csv", encoding="utf-8-sig"),
+        SQLiteStorage("output/crawler.db"),
+    )
+    crawler = AsyncCrawler(storage=storage)
+    await crawler.crawl(start_urls=["https://quotes.toscrape.com/"], max_pages=20)
+    await crawler.close()  # closes the storages too
+
+    async with SQLiteStorage("output/crawler.db") as db:
+        print(await db.summary())
+        print([p["title"] for p in await db.find(title_contains="Quotes", limit=5)])
+    pages = await JSONStorage("output/results.json").load()  # crawled_at is a datetime again
 ```
