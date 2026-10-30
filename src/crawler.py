@@ -14,13 +14,16 @@ import asyncio
 import itertools
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 
 import aiohttp
 
 from circuit_breaker import CircuitBreaker
 from crawler_queue import CrawlerQueue
-from errors import CircuitOpenError, CrawlerError, NetworkError, TransientError, classify_exception
+from errors import (
+    CircuitOpenError, CrawlerError, NetworkError, PermanentError, TransientError, classify_exception,
+)
 from html_parser import HTMLParser, normalize_url
 from models import FetchResult
 from rate_limiter import RateLimiter
@@ -243,8 +246,13 @@ class AsyncCrawler:
             sock_read=t.sock_read and t.sock_read * k,
         )
 
-    async def _fetch_once(self, result: FetchResult) -> None:
-        """One request; fills result or raises a classified CrawlerError."""
+    async def _fetch_once(
+        self,
+        result: FetchResult,
+        read: Callable[[aiohttp.ClientResponse], Awaitable] | None = None,
+    ) -> None:
+        """One request; fills result or raises a classified CrawlerError.
+        read(response) gives result.content; the default reads the text."""
         url = result.url
         domain = domain_of(url)
         breaker = self.circuit_breaker
@@ -273,7 +281,7 @@ class AsyncCrawler:
                     result.status = response.status
                     result.final_url = str(response.url)
                     result.content_type = response.content_type
-                    result.content = await response.text()
+                    result.content = await (read(response) if read else response.text())
             except Exception as exc:
                 error = classify_exception(exc, url)
                 self._record_health(domain, error)
@@ -295,6 +303,16 @@ class AsyncCrawler:
             self.circuit_breaker.record_success(domain)
 
     async def _robots_allowed(self, url: str) -> bool:
+        """Check a page against robots.txt; a disallowed one is logged and
+        recorded in blocked_urls."""
+        if await self._check_robots(url):
+            return True
+        if url not in self.blocked_urls:
+            self.blocked_urls.add(url)
+            logger.warning("Blocked by robots.txt: %s", url)
+        return False
+
+    async def _check_robots(self, url: str) -> bool:
         """Check url against robots.txt of its site (loaded on first use) and
         pass the site's Crawl-delay on to the rate limiter."""
         await self.robots.fetch_robots(url)
@@ -303,12 +321,7 @@ class AsyncCrawler:
         if delay and self.rate_limiter.domain_delays.get(domain) != delay:
             logger.info("Crawl-delay %.1fs for %s", delay, domain)
             self.rate_limiter.set_domain_delay(domain, delay)
-        if self.robots.can_fetch(url, self.user_agent):
-            return True
-        if url not in self.blocked_urls:
-            self.blocked_urls.add(url)
-            logger.warning("Blocked by robots.txt: %s", url)
-        return False
+        return self.robots.can_fetch(url, self.user_agent)
 
     async def fetch_url(self, url: str) -> str:
         """Fetch a single page. Returns an empty string on error."""
@@ -321,6 +334,22 @@ class AsyncCrawler:
         await strategy.execute_with_retry(crawler.fetch_once, url)"""
         result = FetchResult(url=url, attempts=1)
         await self._fetch_once(result)
+        return result.content
+
+    async def fetch_bytes(self, url: str, max_size: int = -1) -> bytes:
+        """A file that is not a page (a sitemap...) through the same pipeline
+        as pages: robots.txt, rate and concurrency limits, the circuit breaker
+        and retries. Reads at most max_size bytes (-1: all). Raises a
+        CrawlerError subclass on failure."""
+        if self.respect_robots and not await self._check_robots(url):
+            raise PermanentError(BLOCKED_ERROR, url=url)
+        result = FetchResult(url=url)
+
+        async def attempt(url: str) -> None:
+            result.attempts += 1
+            await self._fetch_once(result, read=lambda response: response.content.read(max_size))
+
+        await self.retry_strategy.execute_with_retry(attempt, url)
         return result.content
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
@@ -433,6 +462,12 @@ class AsyncCrawler:
             if self.respect_robots and not await self._robots_allowed(url):
                 queue.mark_blocked(url)
                 continue
+            # While this worker waited for robots.txt, the others may have
+            # used up max_pages. The check and the count below run with no
+            # await in between, so no two workers can take the last slot
+            if self._pages_taken >= max_pages:
+                queue.put_back(url)
+                break
             self._pages_taken += 1
             if self._pages_taken >= max_pages:
                 queue.close()  # the remaining URLs stay queued, unfetched

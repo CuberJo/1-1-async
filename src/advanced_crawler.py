@@ -102,8 +102,13 @@ class AdvancedCrawler(AsyncCrawler):
         )
         self.config = config
         self.stats = CrawlerStats()
+        # Sitemap requests share the pages' pipeline: robots.txt, rate and
+        # concurrency limits, the circuit breaker and retries
         self.sitemaps = SitemapParser(
-            self._get_session, user_agent=self.user_agent, max_urls=config.sitemap.max_urls
+            user_agent=self.user_agent,
+            max_urls=config.sitemap.max_urls,
+            fetcher=self.fetch_bytes,
+            robots=self.robots,
         )
         self.sitemap_urls: list[str] = []  # pages found in sitemaps by the last crawl()
         self.start_urls: list[str] = []

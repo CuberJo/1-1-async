@@ -9,7 +9,8 @@ from urllib.parse import urljoin
 
 import aiohttp
 
-from robots_parser import origin_of, parse_robots
+from errors import CrawlerError
+from robots_parser import RobotsParser, origin_of, parse_robots
 
 logger = logging.getLogger("crawler.sitemap")
 
@@ -71,6 +72,11 @@ class SitemapParser:
     - within one fetch_sitemap() call every sitemap is loaded once: cycles
       and repeated children are skipped. A later call loads them again;
     - discover(site_url): sitemaps listed in robots.txt, else /sitemap.xml;
+    - fetcher(url, max_size) -> bytes, if given, makes every sitemap
+      request instead of a plain session.get(): AdvancedCrawler passes its
+      fetch_bytes, so sitemaps obey the same robots.txt, rate limits,
+      concurrency limits and retries as pages; robots, if given, is the
+      RobotsParser whose cached robots.txt find_sitemaps() reads;
     - a sitemap that fails to load or parse is logged and recorded in
       self.errors, the others are still used: the result is never an exception;
       errors and loaded add up over calls until reset().
@@ -85,8 +91,12 @@ class SitemapParser:
         timeout: float = 30.0,
         max_depth: int = 3,
         max_urls: int = 50_000,
+        fetcher: Callable[[str, int], Awaitable[bytes]] | None = None,
+        robots: RobotsParser | None = None,
     ):
         self._session_factory = session_factory
+        self._fetcher = fetcher
+        self.robots = robots
         self._own_session: aiohttp.ClientSession | None = None
         self.user_agent = user_agent
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -125,7 +135,7 @@ class SitemapParser:
         try:
             content = await self._download(sitemap_url)
             kind, locations = parse_sitemap(content)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError, EOFError) as e:
+        except (CrawlerError, aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError, EOFError) as e:
             error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             logger.warning("Sitemap %s failed: %s", sitemap_url, error)
             self.errors[sitemap_url] = error
@@ -156,6 +166,15 @@ class SitemapParser:
                 urls.setdefault(loc, None)
 
     async def _download(self, url: str) -> bytes:
+        if self._fetcher is not None:
+            body = await self._fetcher(url, SITEMAP_MAX_SIZE + 1)
+        else:
+            body = await self._get(url)
+        if len(body) > SITEMAP_MAX_SIZE:
+            raise ValueError(f"sitemap larger than {SITEMAP_MAX_SIZE // 2**20} MiB")
+        return body
+
+    async def _get(self, url: str) -> bytes:
         session = await self._get_session()
         async with session.get(
             url,
@@ -165,15 +184,16 @@ class SitemapParser:
         ) as response:
             # aiohttp undoes Content-Encoding: gzip; a .gz file stays packed
             # and parse_sitemap recognises it by its magic bytes
-            body = await response.content.read(SITEMAP_MAX_SIZE + 1)
-        if len(body) > SITEMAP_MAX_SIZE:
-            raise ValueError(f"sitemap larger than {SITEMAP_MAX_SIZE // 2**20} MiB")
-        return body
+            return await response.content.read(SITEMAP_MAX_SIZE + 1)
 
     async def find_sitemaps(self, site_url: str) -> list[str]:
         """Sitemap URLs of a site: the Sitemap: lines of its robots.txt, or
         /sitemap.xml when robots.txt lists none."""
         origin = origin_of(site_url)
+        if self.robots is not None:
+            await self.robots.fetch_robots(site_url)
+            rules = self.robots.get_rules(site_url)
+            return (rules.sitemaps if rules else []) or [origin + "/sitemap.xml"]
         try:
             session = await self._get_session()
             async with session.get(
